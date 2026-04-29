@@ -1,0 +1,356 @@
+-- Core raw table (example shape; adapt names/types to your loader)
+CREATE TABLE IF NOT EXISTS trackman_events (
+  event_id              bigserial PRIMARY KEY,
+  game_id               text,
+  game_date             date,
+  team                  text,
+  opponent              text,
+
+  pitcher_id            text,
+  pitcher_name          text,
+  batter_id             text,
+  batter_name           text,
+  catcher_id            text,
+  catcher_name          text,
+
+  inning                int,
+  inning_half           text,         -- 'Top'/'Bottom'
+  balls                 int,
+  strikes               int,
+  outs                  int,
+
+  pitcher_throws        text,         -- 'R'/'L'
+  batter_side           text,         -- 'R'/'L'
+
+  tagged_pitch_type     text,
+  auto_pitch_type       text,
+  pitch_call            text,         -- BallCalled, StrikeCalled, StrikeSwinging, FoulBall, InPlay, etc.
+  korbb                 text,         -- Strikeout, Walk, etc.
+  play_result           text,         -- Single/Double/Out/etc.
+  tagged_hit_type       text,
+
+  rel_speed             numeric,
+  spin_rate             numeric,
+  induced_vert_break    numeric,
+  horz_break            numeric,
+  rel_height            numeric,
+  rel_side              numeric,
+  extension             numeric,
+  plate_loc_height      numeric,
+  plate_loc_side        numeric,
+
+  exit_speed            numeric,      -- EV
+  angle                 numeric,      -- Launch angle
+
+  run_date              timestamptz default now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tm_game_date ON trackman_events(game_date);
+CREATE INDEX IF NOT EXISTS idx_tm_pitcher_date ON trackman_events(pitcher_id, game_date);
+CREATE INDEX IF NOT EXISTS idx_tm_batter_date ON trackman_events(batter_id, game_date);
+CREATE INDEX IF NOT EXISTS idx_tm_catcher_date ON trackman_events(catcher_id, game_date);CREATE OR REPLACE VIEW v_pitch_events AS
+SELECT
+  e.*,
+  COALESCE(NULLIF(tagged_pitch_type, ''), auto_pitch_type) AS pitch_type,
+
+  -- Swings
+  CASE WHEN pitch_call IN ('StrikeSwinging','FoulBall','FoulBallNotFieldable','FoulBallFieldable','InPlay') THEN 1 ELSE 0 END AS is_swing,
+
+  -- Whiffs
+  CASE WHEN pitch_call IN ('StrikeSwinging') THEN 1 ELSE 0 END AS is_whiff,
+
+  -- Called strikes
+  CASE WHEN pitch_call IN ('StrikeCalled') THEN 1 ELSE 0 END AS is_called_strike,
+
+  -- In play contact
+  CASE WHEN pitch_call = 'InPlay' THEN 1 ELSE 0 END AS is_in_play,
+
+  -- Basic zone (adjust as needed)
+  CASE
+    WHEN plate_loc_side BETWEEN -0.83 AND 0.83
+     AND plate_loc_height BETWEEN 1.50 AND 3.50
+    THEN 1 ELSE 0
+  END AS is_in_zone,
+
+  CASE
+    WHEN plate_loc_side BETWEEN -0.83 AND 0.83
+     AND plate_loc_height BETWEEN 1.50 AND 3.50
+    THEN 0 ELSE 1
+  END AS is_ooz, -- out of zone
+
+  -- Outcomes
+  CASE WHEN korbb IN ('Strikeout') THEN 1 ELSE 0 END AS is_k,
+  CASE WHEN korbb IN ('Walk') THEN 1 ELSE 0 END AS is_bb,
+
+  -- First pitch strike opportunity
+  CASE WHEN balls = 0 AND strikes = 0 THEN 1 ELSE 0 END AS is_00_count,
+
+  -- Hard-hit proxy
+  CASE WHEN exit_speed >= 95 THEN 1 ELSE 0 END AS is_hard_hit
+FROM trackman_events e;-- Bucket by movement shape + velocity
+WITH shaped AS (
+  SELECT
+    pitcher_id, pitcher_name, pitch_type,
+    width_bucket(induced_vert_break, -25, 25, 10) AS ivb_bin,
+    width_bucket(horz_break, -25, 25, 10) AS hb_bin,
+    width_bucket(rel_speed, 60, 100, 8) AS velo_bin,
+    is_swing, is_whiff, is_ooz
+  FROM v_pitch_events
+  WHERE pitch_type IS NOT NULL
+)
+SELECT
+  pitcher_id, pitcher_name, pitch_type, ivb_bin, hb_bin, velo_bin,
+  COUNT(*) AS pitches,
+  SUM(is_swing)::numeric / NULLIF(COUNT(*),0) AS swing_pct,
+  SUM(is_whiff)::numeric / NULLIF(SUM(is_swing),0) AS whiff_pct,
+  SUM(CASE WHEN is_swing=1 AND is_ooz=1 THEN 1 ELSE 0 END)::numeric
+    / NULLIF(SUM(is_ooz),0) AS chase_pct
+FROM shaped
+GROUP BY 1,2,3,4,5,6
+HAVING COUNT(*) >= 20
+ORDER BY whiff_pct DESC NULLS LAST;WITH season AS (
+  SELECT
+    pitcher_id, pitcher_name,
+    AVG((1-is_ooz)::numeric) AS zone_pct_season,
+    AVG((CASE WHEN pitch_call LIKE 'Ball%' THEN 1 ELSE 0 END)::numeric) AS ball_pct_season,
+    AVG((CASE WHEN is_00_count=1 AND (is_called_strike=1 OR is_whiff=1 OR is_in_play=1) THEN 1 ELSE 0 END)::numeric)
+      FILTER (WHERE is_00_count=1) AS fpk_pct_season
+  FROM v_pitch_events
+  WHERE game_date >= date_trunc('year', current_date)
+  GROUP BY 1,2
+),
+last14 AS (
+  SELECT
+    pitcher_id, pitcher_name,
+    AVG((1-is_ooz)::numeric) AS zone_pct_14d,
+    AVG((CASE WHEN pitch_call LIKE 'Ball%' THEN 1 ELSE 0 END)::numeric) AS ball_pct_14d,
+    AVG((CASE WHEN is_00_count=1 AND (is_called_strike=1 OR is_whiff=1 OR is_in_play=1) THEN 1 ELSE 0 END)::numeric)
+      FILTER (WHERE is_00_count=1) AS fpk_pct_14d,
+    COUNT(*) AS pitches_14d
+  FROM v_pitch_events
+  WHERE game_date >= current_date - interval '14 days'
+  GROUP BY 1,2
+)
+SELECT
+  l.pitcher_id, l.pitcher_name, l.pitches_14d,
+  l.zone_pct_14d, s.zone_pct_season,
+  (l.zone_pct_14d - s.zone_pct_season) AS zone_delta,
+  l.ball_pct_14d, s.ball_pct_season,
+  (l.ball_pct_14d - s.ball_pct_season) AS ball_delta,
+  l.fpk_pct_14d, s.fpk_pct_season,
+  (l.fpk_pct_14d - s.fpk_pct_season) AS fpk_delta,
+  CASE
+    WHEN l.pitches_14d < 50 THEN 'LOW_SAMPLE'
+    WHEN (l.zone_pct_14d - s.zone_pct_season) <= -0.05
+      AND (l.ball_pct_14d - s.ball_pct_season) >= 0.04 THEN 'ALERT'
+    ELSE 'OK'
+  END AS command_status
+FROM last14 l
+JOIN season s USING (pitcher_id, pitcher_name)
+ORDER BY command_status DESC, zone_delta ASC;-- parameter: :target_pitcher_id
+WITH pitcher_profile AS (
+  SELECT
+    pitch_type,
+    AVG(rel_speed) AS avg_velo,
+    AVG(induced_vert_break) AS avg_ivb,
+    AVG(horz_break) AS avg_hb,
+    AVG(CASE WHEN is_in_zone=1 THEN 1 ELSE 0 END)::numeric AS zone_rate,
+    COUNT(*)::numeric / SUM(COUNT(*)) OVER () AS usage_rate
+  FROM v_pitch_events
+  WHERE pitcher_id = :target_pitcher_id
+  GROUP BY pitch_type
+),
+hitter_vs_type AS (
+  SELECT
+    batter_id, batter_name, pitch_type,
+    AVG(CASE WHEN is_swing=1 THEN 1 ELSE 0 END)::numeric AS swing_rate,
+    AVG(CASE WHEN is_whiff=1 THEN 1 ELSE 0 END)::numeric AS whiff_per_pitch,
+    AVG(CASE WHEN is_in_play=1 THEN 1 ELSE 0 END)::numeric AS inplay_rate,
+    AVG(exit_speed) FILTER (WHERE is_in_play=1) AS avg_ev,
+    COUNT(*) AS n
+  FROM v_pitch_events
+  WHERE game_date >= current_date - interval '180 days'
+  GROUP BY 1,2,3
+),
+scored AS (
+  SELECT
+    h.batter_id, h.batter_name,
+    SUM(p.usage_rate * COALESCE(h.whiff_per_pitch, 0)) AS weighted_whiff_risk,
+    SUM(p.usage_rate * COALESCE(h.avg_ev, 0)) AS weighted_ev,
+    SUM(p.usage_rate * COALESCE(h.inplay_rate, 0)) AS weighted_inplay
+  FROM pitcher_profile p
+  LEFT JOIN hitter_vs_type h ON h.pitch_type = p.pitch_type
+  GROUP BY h.batter_id, h.batter_name
+)
+SELECT
+  batter_id, batter_name,
+  weighted_whiff_risk, weighted_ev, weighted_inplay,
+  -- Lower attack score = better hitter matchup; tune weights
+  (0.6*weighted_whiff_risk - 0.3*weighted_ev/100.0 - 0.1*weighted_inplay) AS matchup_risk_score
+FROM scored
+WHERE batter_id IS NOT NULL
+ORDER BY matchup_risk_score ASC;-- Parameterize velo threshold
+WITH filtered AS (
+  SELECT *
+  FROM v_pitch_events
+  WHERE rel_speed >= 92
+    AND plate_loc_height >= 2.9
+    AND pitch_type IN ('Fastball','FourSeamFastBall','TwoSeamFastBall','Sinker')
+)
+SELECT
+  batter_id, batter_name,
+  COUNT(*) AS pitches_seen,
+  SUM(is_swing)::numeric / NULLIF(COUNT(*),0) AS swing_pct,
+  SUM(is_whiff)::numeric / NULLIF(SUM(is_swing),0) AS whiff_pct,
+  AVG(exit_speed) FILTER (WHERE is_in_play=1) AS avg_ev_on_contact,
+  SUM(is_hard_hit)::numeric / NULLIF(SUM(is_in_play),0) AS hard_hit_pct
+FROM filtered
+GROUP BY 1,2
+HAVING COUNT(*) >= 20
+ORDER BY hard_hit_pct DESC NULLS LAST, whiff_pct ASC NULLS LAST;WITH month_now AS (
+  SELECT
+    batter_id, batter_name,
+    AVG(exit_speed) FILTER (WHERE is_in_play=1) AS avg_ev_now,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY exit_speed)
+      FILTER (WHERE is_in_play=1) AS ev90_now,
+    COUNT(*) FILTER (WHERE is_in_play=1) AS bbe_now
+  FROM v_pitch_events
+  WHERE game_date >= date_trunc('month', current_date)
+  GROUP BY 1,2
+),
+month_prev AS (
+  SELECT
+    batter_id, batter_name,
+    AVG(exit_speed) FILTER (WHERE is_in_play=1) AS avg_ev_prev,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY exit_speed)
+      FILTER (WHERE is_in_play=1) AS ev90_prev,
+    COUNT(*) FILTER (WHERE is_in_play=1) AS bbe_prev
+  FROM v_pitch_events
+  WHERE game_date >= date_trunc('month', current_date) - interval '1 month'
+    AND game_date <  date_trunc('month', current_date)
+  GROUP BY 1,2
+)
+SELECT
+  n.batter_id, n.batter_name,
+  n.bbe_now, p.bbe_prev,
+  n.avg_ev_now, p.avg_ev_prev,
+  (n.avg_ev_now - p.avg_ev_prev) AS avg_ev_delta,
+  n.ev90_now, p.ev90_prev,
+  (n.ev90_now - p.ev90_prev) AS ev90_delta
+FROM month_now n
+JOIN month_prev p USING (batter_id, batter_name)
+WHERE n.bbe_now >= 10 AND p.bbe_prev >= 10
+ORDER BY avg_ev_delta ASC;WITH last14 AS (
+  SELECT
+    batter_id, batter_name,
+    AVG(exit_speed) FILTER (WHERE is_in_play=1) AS avg_ev_14d,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY exit_speed)
+      FILTER (WHERE is_in_play=1) AS ev90_14d,
+    SUM(is_hard_hit)::numeric / NULLIF(SUM(is_in_play),0) AS hard_hit_14d,
+    COUNT(*) FILTER (WHERE is_in_play=1) AS bbe_14d
+  FROM v_pitch_events
+  WHERE game_date >= current_date - interval '14 days'
+  GROUP BY 1,2
+),
+baseline AS (
+  SELECT
+    batter_id, batter_name,
+    AVG(exit_speed) FILTER (WHERE is_in_play=1) AS avg_ev_base,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY exit_speed)
+      FILTER (WHERE is_in_play=1) AS ev90_base,
+    SUM(is_hard_hit)::numeric / NULLIF(SUM(is_in_play),0) AS hard_hit_base
+  FROM v_pitch_events
+  WHERE game_date >= current_date - interval '90 days'
+    AND game_date < current_date - interval '14 days'
+  GROUP BY 1,2
+)
+SELECT
+  l.batter_id, l.batter_name, l.bbe_14d,
+  l.avg_ev_14d, b.avg_ev_base, (l.avg_ev_14d - b.avg_ev_base) AS avg_ev_delta,
+  l.ev90_14d, b.ev90_base, (l.ev90_14d - b.ev90_base) AS ev90_delta,
+  l.hard_hit_14d, b.hard_hit_base, (l.hard_hit_14d - b.hard_hit_base) AS hard_hit_delta
+FROM last14 l
+JOIN baseline b USING (batter_id, batter_name)
+WHERE l.bbe_14d >= 8
+ORDER BY avg_ev_delta DESC;CREATE TABLE IF NOT EXISTS baserunning_events (
+  event_id          bigserial PRIMARY KEY,
+  game_id           text,
+  game_date         date,
+  pitcher_id        text,
+  catcher_id        text,
+  runner_id         text,
+  base_start        int,      -- 1 or 2
+  attempt_steal     int,      -- 1/0
+  caught_stealing   int,      -- 1/0
+  stolen_base       int,      -- 1/0
+  pop_time_sec      numeric,
+  throw_velo_mph    numeric,
+  throw_on_bag      int       -- 1/0
+);
+
+SELECT
+  catcher_id,
+  COUNT(*) FILTER (WHERE attempt_steal=1) AS attempts,
+  SUM(caught_stealing) FILTER (WHERE attempt_steal=1) AS cs,
+  SUM(caught_stealing)::numeric / NULLIF(COUNT(*) FILTER (WHERE attempt_steal=1),0) AS cs_pct,
+  AVG(pop_time_sec) FILTER (WHERE attempt_steal=1) AS avg_pop_time,
+  AVG(throw_velo_mph) FILTER (WHERE attempt_steal=1) AS avg_throw_velo,
+  AVG(throw_on_bag::numeric) FILTER (WHERE attempt_steal=1) AS on_bag_pct
+FROM baserunning_events
+GROUP BY catcher_id
+HAVING COUNT(*) FILTER (WHERE attempt_steal=1) >= 5
+ORDER BY cs_pct DESC NULLS LAST;-- Table from logistic model output for taken pitches
+CREATE TABLE IF NOT EXISTS pitch_take_model_scores (
+  event_id             bigint PRIMARY KEY,
+  p_strike_expected    numeric
+);
+
+WITH takes AS (
+  SELECT
+    e.catcher_id,
+    e.pitch_call,
+    m.p_strike_expected,
+    CASE WHEN e.pitch_call='StrikeCalled' THEN 1 ELSE 0 END AS called_strike
+  FROM v_pitch_events e
+  JOIN pitch_take_model_scores m USING (event_id)
+  WHERE e.pitch_call IN ('StrikeCalled','BallCalled')
+)
+SELECT
+  catcher_id,
+  COUNT(*) AS taken_pitches,
+  SUM(called_strike - p_strike_expected) AS extra_strikes,
+  AVG(called_strike - p_strike_expected) AS extra_strikes_per_take
+FROM takes
+GROUP BY catcher_id
+HAVING COUNT(*) >= 300
+ORDER BY extra_strikes DESC;SELECT
+  pitcher_id, pitcher_name,
+  catcher_id, catcher_name,
+  COUNT(*) AS pitches,
+  SUM(is_k)::numeric * 9 / NULLIF(COUNT(DISTINCT game_id),0) AS k_per_game_proxy,
+  SUM(is_bb)::numeric * 9 / NULLIF(COUNT(DISTINCT game_id),0) AS bb_per_game_proxy,
+  SUM(is_whiff)::numeric / NULLIF(SUM(is_swing),0) AS whiff_pct,
+  SUM(CASE WHEN is_swing=1 AND is_ooz=1 THEN 1 ELSE 0 END)::numeric / NULLIF(SUM(is_ooz),0) AS chase_pct,
+  (SUM(is_called_strike)+SUM(is_whiff))::numeric / NULLIF(COUNT(*),0) AS csw_pct,
+  AVG(CASE WHEN is_in_zone=1 THEN 1 ELSE 0 END)::numeric AS zone_pct
+FROM v_pitch_events
+GROUP BY 1,2,3,4
+HAVING COUNT(*) >= 200
+ORDER BY pitcher_id, csw_pct DESC;REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pitch_shape_effectiveness;-- Missing critical identifiers
+SELECT
+  SUM(CASE WHEN pitcher_id IS NULL THEN 1 ELSE 0 END) AS missing_pitcher_id,
+  SUM(CASE WHEN batter_id  IS NULL THEN 1 ELSE 0 END) AS missing_batter_id,
+  SUM(CASE WHEN catcher_id IS NULL THEN 1 ELSE 0 END) AS missing_catcher_id
+FROM trackman_events;
+
+-- Impossible location values
+SELECT COUNT(*) AS bad_loc_rows
+FROM trackman_events
+WHERE plate_loc_height NOT BETWEEN -2 AND 8
+   OR plate_loc_side   NOT BETWEEN -5 AND 5;
+
+-- Duplicates (example key)
+SELECT game_id, inning, balls, strikes, pitcher_id, batter_id, COUNT(*)
+FROM trackman_events
+GROUP BY 1,2,3,4,5,6
+HAVING COUNT(*) > 1;
